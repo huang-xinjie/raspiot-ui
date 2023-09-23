@@ -1,54 +1,63 @@
 // Variables used by Scriptable.
 // These must be at the very top of the file. Do not edit.
 // icon-color: blue; icon-glyph: sitemap;
-var para = args.queryParameters
-log(para)
-raspiot_ip = para.ip || "192.168.31.242"    // replace with your raspiot-server's LAN IP
-const raspiot_endpoint = "http://" + raspiot_ip
-log(raspiot_endpoint)
+raspiot_endpoint = ""
+room_in_process = false
 main()
 
 function main() {
-    action = ["smart home"]
-    alert = new Alert()
-    alert.title = "raspiot"
-    for (a in action) {
-        alert.addAction(action[a])
+    var args_para = args.queryParameters
+    log("args: " + JSON.stringify(args_para))
+    raspiot_ip = args_para.ip || ""    // replace with your raspiot-server's LAN IP
+    if (raspiot_ip) {
+        raspiot_endpoint = "http://" + raspiot_ip
+        raspiot()
+    } else {
+        let input =  new Alert()
+        input.title = "Input raspiot-server's IP"
+        input.addTextField("raspiot-server's LAN IP")
+        input.addAction("OK")
+        input.addCancelAction("Cancel")
+        input.presentAlert().then(idx => {
+            if(idx == 0) {
+                raspiot_endpoint = "http://" + input.textFieldValue(0)
+                raspiot()
+            }
+        })
     }
-    
-    alert.addCancelAction("exit")
-    alert.presentSheet().then(idx => {
-        if(idx == 0)
-            raspiot()
-    })
 }
 
 async function raspiot() {
     house = "raspiot home"
-    rooms = await get_room_list(house)
     house_table = new UITable()
-    house_table.showSeparators = true
     title = new UITableRow()
     title.isHeader = true
-    title.backgroundColor = Color.blue()
+    title.backgroundColor = title_color()
     back = title.addButton("🔚")
     back.leftAligned()
     back.widthWeight =10
     back.dismissOnTap = true
-    back.onTap = () => {
-        log("exit")
-    }
+
     room_name = title.addText(house)
     room_name.centerAligned()
     room_name.widthWeight = 80
-    menu = title.addButton("📋")
-    menu.rightAligned()
+    menu = title.addButton("•••")
     menu.widthWeight = 10
+    menu.rightAligned()
     menu.onTap = () => {
         handle_room(house)
     }
     house_table.addRow(title)
 
+    loading = new UITableRow()
+    loading.addImageAtURL(icon_uri("loading")).centerAligned()
+    loading.height = 30
+    house_table.addRow(loading)
+    house_table.present(fullscreen=true)
+
+    rooms = await get_room_list(house)
+    house_table.showSeparators = true
+    house_table.removeRow(loading)
     for (r in rooms) {
         let room = rooms[r]
         room_row = new UITableRow()
@@ -63,43 +72,60 @@ async function raspiot() {
         room_ui.centerAligned()
         house_table.addRow(room_row)
     }
-    house_table.present(fullscreen=true)
+    house_table.reload()
 }
 
-async function in_room(table, room, select, on_show) {
+async function get_room_list(house) {
+    url = raspiot_endpoint + "/rooms"
+    req = new Request(url)
+    req.timeoutInterval = 2
+    try {
+        return await req.loadJSON()
+    } catch (error) {
+        notification("Get room list failed", "pls check network and raspiot-server.")
+        return []
+    }
+}
+
+async function in_room(table, room, select, on_show, realtime) {
+    if (room_in_process) {
+        log("room in process, skip.")
+        return
+    }
+
     select = select || ""
     on_show = on_show || ""
-    devices = await get_device_list(room)
-    log("tap " + select)
+    realtime = realtime || false
+    room_in_process = true
     table.removeAllRows()
     title = new UITableRow()
     title.isHeader = true
-    title.backgroundColor = Color.blue()
-    back = title.addButton("🔙")
-    back.leftAligned()
-    back.widthWeight =10
-    back.dismissOnTap = true
-    back.onTap = () => {
-        log("back to raspiot")
+    title.backgroundColor = title_color()
+    live = title.addButton("live")
+    live.leftAligned()
+    live.widthWeight =10
+    live.onTap = () => {
+        in_room(table, room, select, on_show, true)
     }
     room_name = title.addText(room)
     room_name.centerAligned()
     room_name.widthWeight = 80
-    menu = title.addButton("📋")
+    menu = title.addButton("•••")
     menu.rightAligned()
     menu.widthWeight = 10
     menu.onTap = () => {
-        handle_device(room)
+        handle_device(table, room)
     }
     table.addRow(title)
 
+    devices = await get_device_list(room)
     for (d in devices) {
         let device = devices[d]
         device_row = new UITableRow()
         device_row.dismissOnSelect = false
         device_row.onSelect = () => {
-            on_select = select == on_show ? "" : select
             log("select " + device.name)
+            on_select = select == on_show ? "" : select
             in_room(table, room, device.name, on_select)
         }
         device_row.addText("").widthWeight = 15
@@ -112,19 +138,20 @@ async function in_room(table, room, select, on_show) {
         status.widthWeight = 15
         table.addRow(device_row)
         if (device.name == select && select != on_show) {
-            await show_device(table, room, device)
+            await show_device(table, room, device, realtime)
         }
     }
     table.reload()
+    room_in_process = false
 }
 
 function handle_room(house) {
     let alert = new Alert()
-    alert.title = "handle room"
-    alert.addAction("➕ add room")
-    alert.addAction("🔄 rename room")
-    alert.addDestructiveAction("➖  remove room")
-    alert.addCancelAction("cancel")
+    alert.title = "Handle room"
+    alert.addAction("Add room")
+    alert.addAction("Rename room")
+    alert.addDestructiveAction("Remove room")
+    alert.addCancelAction("Cancel")
     alert.presentSheet().then(idx => {
         if(idx == 0)
             add_room(house)
@@ -137,10 +164,10 @@ function handle_room(house) {
 
 function add_room(house) {
     let alert = new Alert()
-    alert.title = "add room"
+    alert.title = "Add room"
     alert.addTextField("room name")
-    alert.addAction("ok")
-    alert.addCancelAction("cancel")
+    alert.addAction("Add")
+    alert.addCancelAction("Cancel")
     alert.present().then(idx => {
         let room = alert.textFieldValue(0)
         if(room.length > 0) {
@@ -158,21 +185,21 @@ function add_room(house) {
 function rename_room(house) {
     let rooms = get_room_list(house)
     let alert = new Alert()
-    alert.title = "rename room"
+    alert.title = "Rename room"
     for (r in rooms) {
         alert.addAction(rooms[r])
     }
-    alert.addCancelAction("cancel")
+    alert.addCancelAction("Cancel")
     alert.presentSheet().then(idx => {
         if(idx == -1)
             raspiot()
         else if(idx < rooms.length) {
             let oldroom = rooms[idx]
             let checkbox =  new Alert()
-            checkbox.title = "rename " + oldroom + " to"
-            checkbox.addTextField("input the room name")
-            checkbox.addDestructiveAction("rename")
-            checkbox.addCancelAction("cancel")
+            checkbox.title = "Rename " + oldroom + " to"
+            checkbox.addTextField("Input the room name")
+            checkbox.addDestructiveAction("Rename")
+            checkbox.addCancelAction("Cancel")
             checkbox.presentAlert().then(idx => {
                 let newroom = checkbox.textFieldValue(0)
                 if(idx == 0) {
@@ -189,72 +216,59 @@ function rename_room(house) {
 }
 
 function delroom(house) {
-    let rooms = get_room_list(house)
     let alert = new Alert()
-    alert.title = "remove room"
+    alert.title = "Remove room"
+    let rooms = get_room_list(house)
     for (r in rooms) {
         alert.addAction(rooms[r])
     }
-    alert.addCancelAction("cancel")
+    alert.addCancelAction("Cancel")
     alert.presentSheet().then(idx => {
         if(idx == -1)
             raspiot()
         else if(idx < rooms.length) {
             let room = rooms[idx]
             let checkbox =  new Alert()
-            checkbox.title = "Are you sure to remove the " + room + "?"
-            checkbox.addTextField("input the room name")
-            checkbox.addDestructiveAction("remove")
-            checkbox.addCancelAction("cancel")
+            checkbox.title = "Remove room"
+            checkbox.message = "Sure to remove the " + room + "?"
+            checkbox.addDestructiveAction("Remove")
+            checkbox.addCancelAction("Cancel")
             checkbox.presentAlert().then(idx => {
                 if(idx == 0) {
-                    if(checkbox.textFieldValue(0) == room)
-                        console.log(room + " is removed.")
-                    else
-                        console.log("input no match. remove cancel.")
-                } else {
-                    raspiot()
+                    console.log(room + " is removed.")
                 }
             })
         }
     })
 }
 
-async function get_room_list(house) {
-    url = raspiot_endpoint + "/rooms"
-    req = new Request(url)
+async function get_device_list(room) {
+    url = raspiot_endpoint + "/devices?room=" + room
+    let req = new Request(url)
     req.timeoutInterval = 5
-    rooms = await req.loadJSON()
-    log(rooms)
-    return rooms
+    let devices = await req.loadJSON()
+    log(devices)
+    return devices
 }
 
-function handle_device(room) {
-    let alert = new Alert()
-    alert.title = "handle device"
-    alert.addAction("➕ add device")
-    alert.addAction("🔄 rename device")
-    alert.addDestructiveAction("➖  remove device")
-    alert.addCancelAction("back")
-    alert.presentSheet().then(idx => {
-        if(idx == -1)
-            in_room(room)
-        else if(idx == 0)
-            add_device(room)
-        else if(idx == 1)
-            rename_device(room)
-        else if(idx == 2)
-            del_device(room)
-    })
+async function get_device_attrs(device_uuid, realtime) {
+    url = raspiot_endpoint + "/device/" + device_uuid + "?realtime=" + realtime
+    let req = new Request(url)
+    req.timeoutInterval = 5
+    try {
+        return await req.loadJSON()
+    } catch (error) {
+        notification("Get device attrs failed", "pls check network and raspiot-server.")
+    }
 }
 
-async function show_device(table, room, device) {
+async function show_device(table, room, device, realtime) {
     log("show " + device.name)
-    device = await get_device_attrs(device.uuid)
+    device = await get_device_attrs(device.uuid, realtime)
     for (d in device.attrs) {
         row = new UITableRow()
         row.dismissOnSelect = false
-        row.backgroundColor = device.status == "online" ? Color.green() : Color.yellow()
+        row.backgroundColor = device.status == "online" ? Color.green() : Color.orange()
         let attr = device.attrs[d]
         row.addText(attr.name).leftAligned()
         if (attr.type == "text") {
@@ -288,8 +302,7 @@ async function show_device(table, room, device) {
                 set_attr(table, room, device, attr.name, attr.value)
             }
         } else if (attr.type == "switch") {
-            switch_uri = get_switch_uri(attr.value)
-            switch_icon = row.addImageAtURL(switch_uri)
+            switch_icon = row.addImageAtURL(icon_uri(attr.value))
             switch_icon.rightAligned()
             // UITableCell中只有button支持触摸事件，这里用row的选择事件代替
             row.onSelect = () => {
@@ -303,6 +316,10 @@ async function show_device(table, room, device) {
           }
         }
         table.addRow(row)
+    }
+
+    if (!device.attrs.length) {
+        notification("Unable to show attrs", "device " + device.name + " never connected, unable to get device attrs. Pls check the device.")
     }
 }
 
@@ -364,10 +381,8 @@ function set_range(table, room, device, attr) {
 
 async function set_attr(table, room, device, attr_name, attr_value) {
     if (device.status == "offline") {
-        notify = new Notification()
-        notify.title = "Fail to handle device"
-        notify.body = "device is offline"
-        notify.schedule()
+        notification("Fail to handle device",
+                             device.name + " is offline.")
         return
     }
 
@@ -384,99 +399,163 @@ async function set_attr(table, room, device, attr_name, attr_value) {
     in_room(table, room, device.name)
 }
 
-function get_switch_uri(value) {
-    switch_on_uri = raspiot_endpoint + "/statics/switch_on.png"
-    switch_off_uri = raspiot_endpoint + "/statics/switch_off.png"
-    if (value) {
-        return switch_on_uri
+function icon_uri(value) {
+    on_uri = raspiot_endpoint + "/statics/switch_on.png"
+    off_uri = raspiot_endpoint + "/statics/switch_off.png"
+    loading_uri = raspiot_endpoint + "/statics/loading.png"
+    if (value == true) {
+        return on_uri
+    } else if (value == false) {
+        return off_uri
+    } else if (value == "loading") {
+        return loading_uri
     }
-    return switch_off_uri
 }
 
-function add_device(room) {
+function handle_device(table, room) {
     let alert = new Alert()
-    alert.title = "add device"
-    alert.addTextField("device name")
-    alert.addTextField("device mac address")
-    alert.addAction("ok")
-    alert.addCancelAction("cancel")
-    alert.present().then(idx => {
-        if(idx == -1)
-            in_room(room)
+    alert.title = "Handle device"
+    alert.addAction("Add device")
+    alert.addAction("Rename device")
+    alert.addDestructiveAction("Remove device")
+    alert.addCancelAction("Cancel")
+    alert.presentSheet().then(idx => {
+        if(idx == 0)
+            add_device(table, room)
+        else if(idx == 1)
+            rename_device(table, room)
+        else if(idx == 2)
+            del_device(table, room)
     })
 }
 
-function del_device(room) {
-    let devices = get_device_list(room)
+async function add_device(table, room) {
+    device = await scan_device_info()
     let alert = new Alert()
-    alert.title = "remove device"
-    for (d in devices) {
-        alert.addAction(devices[d])
-    }
-    alert.addCancelAction("cancel")
-    alert.presentSheet().then(idx => {
-        if(idx == -1)
-            raspiot()
-        else if(idx < devices.length) {
-            let device = devices[idx]
-            let checkbox =  new Alert()
-            checkbox.title = "Are you sure to remove the " + device + "?"
-            checkbox.addTextField("input the device name")
-            checkbox.addDestructiveAction("remove")
-            checkbox.addCancelAction("cancel")
-            checkbox.presentAlert().then(idx => {
-                if(idx == 0) {
-                    if(checkbox.textFieldValue(0) == device)
-                        console.log(device + " is removed.")
-                    else
-                        console.log("input no match. remove cancel.")
-                } else {
-                    in_room(room)
-                }
-            })
+    alert.title = "Add device"
+    alert.addTextField("* device name", device.name)
+    alert.addTextField("* mac address", device.mac_addr)
+    alert.addTextField("* protocol", device.protocol)
+    alert.addTextField("* port", String(device.port))
+    alert.addTextField("  ipv4 address")
+    alert.addTextField("  ipv6 address")
+    alert.addTextField("  sync mode", device.sync_mode)
+    alert.addTextField("  sync interval", device.sync_interval)
+    alert.addAction("Cancel")
+    alert.addAction("Add")
+    alert.present().then(async idx => {
+        if(idx == 1) {
+            device.name = alert.textFieldValue(0)
+            device.mac_addr = alert.textFieldValue(1)
+            device.protocol = alert.textFieldValue(2)
+            device.port = alert.textFieldValue(3)
+            device.ipv4_addr = alert.textFieldValue(4)
+            device.ipv6_addr = alert.textFieldValue(5)
+            device.sync_mode = alert.textFieldValue(6)
+            device.sync_interval = alert.textFieldValue(7)
+            await add_device_req(room, device)
+            log(room + " add device: " + device.name)
+            in_room(table, room)
         }
     })
 }
 
-async function get_device_list(room) {
-    url = raspiot_endpoint + "/devices?room=" + room
+async function scan_device_info() {
+    scan = new CallbackURL("shortcuts://x-callback-url/run-shortcut")
+    scan.addParameter("name", "qrcode-scan")
+    try {
+        scan_result = await scan.open()
+        return JSON.parse(scan_result.result)
+    } catch (error) {
+        log("scan failed: " + error)
+        return {}
+    }
+}
+
+async function add_device_req(room, device) {
+    url = raspiot_endpoint + "/device"
     let req = new Request(url)
-    req.timeoutInterval = 5
-    let devices = await req.loadJSON()
-    log(devices)
-    return devices
+    req.method="POST"
+    req.timeoutInterval = 10
+    req.headers = {"Content-Type": "application/json"}
+    req.allowInsecureRequest = true
+    req.addParameterToMultipart("name", device.name)
+    req.addParameterToMultipart("mac_addr", device.mac_addr)
+    req.addParameterToMultipart("protocol", device.protocol)
+    req.addParameterToMultipart("port", device.port)
+    req.addParameterToMultipart("ipv4_addr", device.ipv4_addr || "")
+    req.addParameterToMultipart("ipv6_addr", device.ipv6_addr || "")
+    req.addParameterToMultipart("sync_mode", device.sync_mode || "")
+    req.addParameterToMultipart("sync_interval", device.sync_interval || "")
+    req.addParameterToMultipart("room", room)
+    log(req)
+    response = await req.loadJSON()
+    if ((response.code || 200) != 200) {
+        notification("Add device " + device.name + " failed", response.message)
+    }
 }
 
-async function get_device_attrs(device_uuid) {
-    url = raspiot_endpoint + "/device/" + device_uuid
-    let req = new Request(url)
-    req.timeoutInterval = 5
-    let attrs = await req.loadJSON()
-    return attrs
-}
-
-function pi_status() {
-    status = "ip: " + raspiot_ip + "\n"
-    status += "run time: 16mins\n"
-    alert = new Alert()
-    alert.title = "pi's status"
-    alert.message = status
-    alert.addCancelAction("back")
-    alert.presentSheet().then(idx => {
-        if(idx == -1)
-            main()
-    })
-}
-
-function shutdown() {
+async function del_device(room_table, room) {
     let alert = new Alert()
-    alert.title = "Are you sure to shut down?"
-    alert.addDestructiveAction("shut down")
-    alert.addCancelAction("cancel")
-    alert.presentSheet().then(idx => {
-        if(idx == 0)
-            log("shutdown pi")
-        else if(idx == -1)
-            main()
+    alert.title = "Remove device"
+    alert.message = "Tap the device and it will be remove."
+    
+    devices = await get_device_list(room)
+    for (d in devices) {
+        alert.addDestructiveAction(devices[d].name)
+    }
+    alert.addCancelAction("Cancel")
+    alert.present().then(idx => {
+        if(idx >= 0 && idx < devices.length) {
+            del_device_confirm(room_table, room, devices[idx])
+        }
     })
+}
+
+async function del_device_confirm(room_table, room, device) {
+    let checkbox =  new Alert()
+    checkbox.title = "Remove device"
+    checkbox.message = "Confirm to remove the " + device.name + "?"
+//     checkbox.addTextField("Input the device name for confirm.")
+    checkbox.addDestructiveAction("Remove")
+    checkbox.addCancelAction("Cancel")
+    checkbox.presentAlert().then(async idx => {
+        if(idx == 0) {
+//             if(checkbox.textFieldValue(0) == device.name) {
+                await del_device_req(device)
+                console.log(device.name + " is removed.")
+                in_room(room_table, room)
+/*            } else { 
+                console.log("Input no match, remove cancel.")
+            }*/
+        }
+    })
+}
+
+async function del_device_req(device) {
+    url = raspiot_endpoint + "/device/" + device.uuid
+    let req = new Request(url)
+    req.method="DELETE"
+    req.timeoutInterval = 5
+    req.headers = {"Content-Type": "application/json"}
+    req.allowInsecureRequest = true
+    log(req)
+    await req.load()
+}
+
+function title_color() {
+    if (Device.isUsingDarkAppearance()) {
+        return new Color("#111111")
+    } else {
+        return new Color("#ededed")
+    }
+}
+
+function notification(title, body) {
+    notify = new Notification()
+    notify.title = title
+    notify.body = body
+    notify.identifier = "raspiot_notification"
+    notify.schedule()
+    Notification.removeDelivered([notify.identifier])
 }
