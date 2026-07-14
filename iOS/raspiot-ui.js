@@ -1,26 +1,42 @@
 // Variables used by Scriptable.
 // These must be at the very top of the file. Do not edit.
 // icon-color: blue; icon-glyph: sitemap;
+defaultConfig = {
+    raspiotEndpoint: "http://",
+    widgetPadding: 5,
+    widgetShownAttr: [],
+    token: "",
+    refreshToken: "",
+    username: ""
+}
 roomInProcess = false
-CONF = readConfig()
+CONF = loadConfig()
 main()
 
 function main() {
     if (config.runsInWidget) {
-        kwargs = getWidgetParameter()
-        if (kwargs.attr) {
-            showDeviceInWidget(kwargs)
+        if (!CONF.token) {
+            showLoginRequiredWidget()
         } else {
-            showRoomInWidget(kwargs)
+            kwargs = getWidgetParameter()
+            if (kwargs.attr) {
+                showDeviceInWidget(kwargs)
+            } else {
+                showRoomInWidget(kwargs)
+            }
         }
     } else if (args.queryParameters.runType === 'api') {
         runInApi(args.queryParameters)
     } else if (config.runsInApp) {
-        runInApp(args.queryParameters)
+        if (CONF.token) {
+            runInApp(args.queryParameters)
+        } else {
+            showUiAuth()
+        }
     }
 }
 
-function readConfig() {
+function loadConfig() {
     fm = FileManager.local()
     configFile = fm.joinPath(
         fm.documentsDirectory(), "raspiot-ui.json")
@@ -28,18 +44,14 @@ function readConfig() {
         saveConfig()
     }
 
-    return JSON.parse(fm.readString(configFile))
+    loaded = JSON.parse(fm.readString(configFile))
+    return Object.assign({}, defaultConfig, loaded)
 }
 
 function saveConfig() {
     fm = FileManager.local()
     configFile = fm.joinPath(
         fm.documentsDirectory(), "raspiot-ui.json")
-    defaultConfig = {
-        raspiotEndpoint: "http://",
-        widgetPadding: 5,
-        widgetShownAttr: []
-    }
 
     if (typeof CONF == "undefined") {
         CONF = defaultConfig
@@ -47,6 +59,64 @@ function saveConfig() {
 
     fm.writeString(configFile,
         JSON.stringify(CONF))
+}
+
+function newRequest(url) {
+    let req = new Request(url)
+    req.headers = {"Content-Type": "application/json"}
+    req.allowInsecureRequest = true
+    if (CONF.token) {
+        req.headers["Authorization"] = `Bearer ${CONF.token}`
+    }
+    return req
+}
+
+async function fetchReq(req, asJson) {
+    try {
+        return asJson ? await req.loadJSON() : await req.load()
+    } catch (e) {
+        if (req.response && req.response.statusCode === 401) {
+            if (CONF.refreshToken && !req.url.includes('/token')) {
+                let newToken = await postRefreshToken()
+                if (newToken) {
+                    CONF.token = newToken
+                    saveConfig()
+                    req.headers["Authorization"] = `Bearer ${newToken}`
+                    return asJson ? await req.loadJSON() : await req.load()
+                }
+            }
+            CONF.token = ""
+            CONF.username = ""
+            saveConfig()
+            notification("Token expired", "Please re-login in Settings")
+        }
+        throw e
+    }
+}
+
+async function postRefreshToken() {
+    let url = encodeURI(`${CONF.raspiotEndpoint}/token:refresh`)
+    let req = new Request(url)
+    req.method = "POST"
+    req.timeoutInterval = 10
+    req.allowInsecureRequest = true
+    req.headers = {"Authorization": `Bearer ${CONF.refreshToken}`}
+    try {
+        let response = await req.loadJSON()
+        return response.token || null
+    } catch (e) {
+        return null
+    }
+}
+
+function decodeJwtRole(token) {
+    try {
+        let payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")
+        while (payload.length % 4) payload += "="
+        return JSON.parse(Data.fromBase64(payload).toUTF8String()).role
+    } catch (e) {
+        return null
+    }
 }
 
 async function runInApi(kwargs) {
@@ -58,7 +128,7 @@ async function runInApi(kwargs) {
     devices = await getDeviceList(filters)
     if (!devices) {
         notification("Invalid device", `device ${cmd.device} not found`)
-        Script.complete()
+        return null
     }
 
     device = devices[0]
@@ -102,17 +172,29 @@ function getWidgetParameter() {
     return parameter
 }
 
+function showLoginRequiredWidget() {
+    let lw = new ListWidget()
+    lw.backgroundColor = new Color("#ac3929")
+    setListWidgetText(lw, "Pls run in app and login first.", 22).centerAlignText()
+    lw.url = encodeURI(`scriptable:///run?scriptName=${Script.name()}`)
+    Script.setWidget(lw)
+    Script.complete()
+}
+
 async function showDeviceInWidget(kwargs) {
     // action=get&room=bedroom&device=dht11温湿度&attr=temp
     log("kwargs: " + JSON.stringify(kwargs))
     const lw = new ListWidget()
-    value = await runInApi(kwargs)
-
     lw.backgroundColor = new Color("#ac3929")
-    setListWidgetText(lw, kwargs.room, 26)
-    setListWidgetText(lw, kwargs.device, 22)
-    setListWidgetText(lw, kwargs.attr, 18)
-    setListWidgetText(lw, String(value), 18)
+    let value = await runInApi(kwargs)
+    if (value == null) {
+        setListWidgetText(lw, "Fail to request, pls check network or raspiot-server.", 18).centerAlignText()
+    } else {
+        setListWidgetText(lw, kwargs.room, 26)
+        setListWidgetText(lw, kwargs.device, 22)
+        setListWidgetText(lw, kwargs.attr, 18)
+        setListWidgetText(lw, String(value), 18)
+    }
     Script.setWidget(lw)
     Script.complete()
 }
@@ -150,7 +232,6 @@ async function showRoomInWidget(kwargs) {
     } else {
         if (rooms === null) {
             msg = "Fail to request, pls check network or raspiot-server."
-            rooms.has("")  // keep widget display
         } else if (CONF.raspiotEndpoint === "http://") {
             msg = "Pls set raspiot-server's ip in settings at first."
         } else {
@@ -396,6 +477,25 @@ async function uiSetting(settingTable) {
     }
     settingTable.addRow(ipTest)
 
+    accountRow = new UITableRow()
+    accountRow.dismissOnSelect = false
+    accountRow.addText("Account").leftAligned()
+    if (CONF.token && CONF.username) {
+        let role = decodeJwtRole(CONF.token)
+        let label = role ? `${CONF.username} (${role})` : CONF.username
+        accountRow.addText(label).rightAligned()
+    } else {
+        accountRow.addText("not logged in").rightAligned()
+    }
+    accountRow.onSelect = () => {
+        if (CONF.token && CONF.username) {
+            accountAction(settingTable)
+        } else {
+            showLoginForm(settingTable)
+        }
+    }
+    settingTable.addRow(accountRow)
+
     settingSeparator = new UITableRow()
     settingSeparator.height = 10
     settingTable.addRow(settingSeparator)
@@ -463,6 +563,265 @@ function showAboutInfo() {
     aboutTable.present(fullscreen=false)
 }
 
+async function showUiAuth() {
+    let authTable = new UITable()
+    uiAuth(authTable)
+    authTable.showSeparators = false
+    authTable.present(true)
+}
+
+async function uiAuth(authTable) {
+    authTable.removeAllRows()
+
+    let settingsRow = new UITableRow()
+    settingsRow.dismissOnSelect = false
+    settingsRow.addText("⚙").leftAligned()
+    settingsRow.onSelect = () => {
+        showUiSetting()
+    }
+    authTable.addRow(settingsRow)
+
+    let blankRow = new UITableRow()
+    blankRow.height = 220
+    authTable.addRow(blankRow)
+
+    let enterApp = () => {
+        authTable.dismiss()
+        runInApp(args.queryParameters)
+    }
+
+    let signIn = new UITableRow()
+    signIn.height = 60
+    signIn.addImage(drawButton(new Color("#5db85d"), "Log in")).centerAligned()
+    signIn.dismissOnSelect = false
+    signIn.onSelect = () => {
+        showLoginForm(authTable, enterApp)
+    }
+    authTable.addRow(signIn)
+
+    let signUp = new UITableRow()
+    signUp.height = 60
+    signUp.addImage(drawButton(new Color("#5cc0de"), "No account? Sign up!")).centerAligned()
+    signUp.dismissOnSelect = false
+    signUp.onSelect = () => {
+        registerForm(authTable, enterApp)
+    }
+    authTable.addRow(signUp)
+}
+
+function drawButton(color, text) {
+    let size = 40
+    let dc = new DrawContext()
+    dc.opaque = false
+    dc.respectScreenScale = true
+    dc.size = new Size(size * 6, size)
+    dc.setTextColor(Color.black())
+    dc.setFont(Font.systemFont(12))
+    dc.setFillColor(color)
+
+    let path = new Path()
+    let rect = new Rect(0, 0, size * 6, size)
+    path.addRoundedRect(rect, 10, 10)
+    dc.addPath(path)
+    dc.fillPath()
+    dc.setTextAlignedCenter()
+    dc.drawTextInRect(`\n${text}`, rect)
+    return dc.getImage()
+}
+
+function accountAction(settingTable) {
+    let role = decodeJwtRole(CONF.token)
+    let canManage = role === "owner" || role === "admin"
+    let alert = new Alert()
+    alert.title = "Account"
+    alert.message = CONF.username
+    if (canManage) {
+        alert.addAction("Manage users")
+    }
+    alert.addDestructiveAction("Logout")
+    alert.addCancelAction("Cancel")
+    alert.presentSheet().then(idx => {
+        if (canManage && idx === 0) {
+            manageUsersForm(settingTable)
+        } else if ((!canManage && idx === 0) || (canManage && idx === 1)) {
+            CONF.token = ""
+            CONF.username = ""
+            saveConfig()
+            uiSetting(settingTable)
+        }
+    })
+}
+
+function showLoginForm(settingTable, onSuccess) {
+    onSuccess = onSuccess || (() => uiSetting(settingTable))
+    let alert = new Alert()
+    alert.title = "Login"
+    alert.addTextField("username")
+    alert.addSecureTextField("password")
+    alert.addAction("Login")
+    alert.addAction("Register")
+    alert.addCancelAction("Cancel")
+    alert.presentAlert().then(async idx => {
+        if (idx === 0) {
+            let username = alert.textFieldValue(0)
+            let password = alert.textFieldValue(1)
+            let token = await postToken(username, password)
+            if (token) {
+                CONF.token = token
+                CONF.username = username
+                saveConfig()
+                onSuccess()
+            }
+        } else if (idx === 1) {
+            registerForm(settingTable, onSuccess)
+        }
+    })
+}
+
+async function postToken(username, password) {
+    url = encodeURI(`${CONF.raspiotEndpoint}/token`)
+    let req = newRequest(url)
+    req.method = "POST"
+    req.timeoutInterval = 10
+    req.addParameterToMultipart("username", username)
+    req.addParameterToMultipart("password", password)
+    try {
+        let response = await fetchReq(req, true)
+        if (response.token) {
+            CONF.refreshToken = response.refresh_token || ""
+            return response.token
+        }
+        notification("Login failed", response.message || "invalid credentials")
+    } catch (error) {
+        notification("Login failed", "pls check raspiot-server or credentials.")
+    }
+    return null
+}
+
+function registerForm(settingTable, onSuccess) {
+    onSuccess = onSuccess || (() => uiSetting(settingTable))
+    let alert = new Alert()
+    alert.title = "Register"
+    alert.addTextField("name")
+    alert.addTextField("email")
+    alert.addSecureTextField("password")
+    alert.addAction("Register")
+    alert.addCancelAction("Cancel")
+    alert.presentAlert().then(async idx => {
+        if (idx === 0) {
+            let name = alert.textFieldValue(0)
+            let email = alert.textFieldValue(1)
+            let password = alert.textFieldValue(2)
+            let ok = await postRegister(name, email, password)
+            if (ok) {
+                let token = await postToken(name, password)
+                if (token) {
+                    CONF.token = token
+                    CONF.username = name
+                    saveConfig()
+                    onSuccess()
+                }
+            }
+        }
+    })
+}
+
+async function postRegister(name, email, password) {
+    url = encodeURI(`${CONF.raspiotEndpoint}/users`)
+    let req = newRequest(url)
+    req.method = "POST"
+    req.timeoutInterval = 10
+    req.addParameterToMultipart("name", name)
+    req.addParameterToMultipart("email", email)
+    req.addParameterToMultipart("password", password)
+    try {
+        let response = await fetchReq(req, true)
+        if ((response.code || 200) !== 200) {
+            notification("Register failed", response.message || "pls check raspiot-server.")
+            return false
+        }
+        notification("User created", `${name} registered`)
+        return true
+    } catch (error) {
+        notification("Register failed", "pls check raspiot-server or credentials.")
+        return false
+    }
+}
+
+async function getUserList() {
+    let url = encodeURI(`${CONF.raspiotEndpoint}/users`)
+    let req = newRequest(url)
+    req.timeoutInterval = 10
+    try {
+        return await fetchReq(req, true)
+    } catch (error) {
+        notification("Get users failed", "pls check raspiot-server.")
+        return null
+    }
+}
+
+async function putUser(uuid, role) {
+    let url = encodeURI(`${CONF.raspiotEndpoint}/users/${uuid}`)
+    let req = newRequest(url)
+    req.method = "PUT"
+    req.timeoutInterval = 10
+    req.addParameterToMultipart("role", role)
+    try {
+        let response = await fetchReq(req, true)
+        if ((response.code || 200) !== 200) {
+            notification("Update user failed", response.message || "pls check raspiot-server.")
+            return false
+        }
+        return true
+    } catch (error) {
+        notification("Update user failed", "pls check raspiot-server.")
+        return false
+    }
+}
+
+async function manageUsersForm(settingTable) {
+    let users = await getUserList()
+    if (!users) {
+        return
+    }
+    let role = decodeJwtRole(CONF.token)
+    let assignableRoles = role === "owner"
+        ? ["admin", "member", "guest"]
+        : ["member", "guest"]
+
+    let alert = new Alert()
+    alert.title = "Manage users"
+    alert.message = "Select user to update"
+    for (let u of users) {
+        alert.addAction(`${u.name} (${u.role})`)
+    }
+    alert.addCancelAction("Cancel")
+    alert.presentAlert().then(async idx => {
+        if (idx >= users.length) {
+            return
+        }
+        let user = users[idx]
+        let roleAlert = new Alert()
+        roleAlert.title = `Role for ${user.name}`
+        roleAlert.message = `current: ${user.role}`
+        for (let r of assignableRoles) {
+            roleAlert.addAction(r)
+        }
+        roleAlert.addCancelAction("Cancel")
+        roleAlert.presentAlert().then(async ridx => {
+            if (ridx >= assignableRoles.length) {
+                return
+            }
+            let newRole = assignableRoles[ridx]
+            let ok = await putUser(user.uuid, newRole)
+            if (ok) {
+                notification("Role updated", `${user.name} → ${newRole}`)
+                manageUsersForm(settingTable)
+            }
+        })
+    })
+}
+
 async function setWidgetAttr(table, devices, selected) {
     selected = selected || new Set(CONF.widgetShownAttr)
     table.removeAllRows()
@@ -521,12 +880,12 @@ async function setWidgetAttr(table, devices, selected) {
 }
 
 async function serviceabilityTest() {
-    url = encodeURI(`${CONF.raspiotEndpoint}/`)
-    req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/hello/world`)
+    req = newRequest(url)
     req.timeoutInterval = 2
     return new Promise(async function(resolve, reject) {
         try {
-            await req.load()
+            await fetchReq(req, false)
             resolve("available")
         } catch (error) {
             log("service unavailable.")
@@ -537,10 +896,10 @@ async function serviceabilityTest() {
 
 async function getRoomList() {
     url = encodeURI(`${CONF.raspiotEndpoint}/rooms`)
-    req = new Request(url)
+    req = newRequest(url)
     req.timeoutInterval = 2
     try {
-        return await req.loadJSON()
+        return await fetchReq(req, true)
     } catch (error) {
         log("get room list failed.")
         return null
@@ -563,6 +922,14 @@ async function inRoom(table, room, onShow, realtime) {
     onShow = onShow || new Set()
     realtime = realtime || false
     roomInProcess = true
+    try {
+        await uiRoom(table, room, onShow, realtime)
+    } finally {
+        roomInProcess = false
+    }
+}
+
+async function uiRoom(table, room, onShow, realtime) {
     table.removeAllRows()
     title = new UITableRow()
     title.isHeader = true
@@ -616,7 +983,6 @@ async function inRoom(table, room, onShow, realtime) {
         }
     }
     table.reload()
-    roomInProcess = false
 }
 
 async function handleRoom(houseTable) {
@@ -657,15 +1023,13 @@ function addRoom(houseTable, rooms) {
 }
 
 async function addRoomReq(room) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/room`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/rooms`)
+    let req = newRequest(url)
     req.method = "POST"
     req.timeoutInterval = 10
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
     req.addParameterToMultipart("name", room)
     try {
-        response = await req.loadJSON()
+        response = await fetchReq(req, true)
         if ((response.code || 200) !== 200) {
             notification(`Add room ${room} failed`, response.message)
         }
@@ -707,16 +1071,14 @@ async function renameRoom(houseTable, rooms) {
 }
 
 async function updateRoomReq(room, newName) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/room/${room}`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/rooms/${room}`)
+    let req = newRequest(url)
     req.method = "PUT"
     req.timeoutInterval = 5
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
     req.addParameterToMultipart("name", newName)
 
     try {
-        response = await req.load()
+        response = await fetchReq(req, false)
         if ((response.code || 200) !== 200) {
             notification(`Update room ${room} failed`, response.message)
         }
@@ -751,15 +1113,13 @@ async function delRoom(houseTable, rooms) {
 }
 
 async function delRoomReq(room) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/room/${room}`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/rooms/${room}`)
+    let req = newRequest(url)
     req.method = "DELETE"
     req.timeoutInterval = 5
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
 
     try {
-        await req.load()
+        await fetchReq(req, false)
     } catch (error) {
         notification(`Remove room ${room} failed`, "pls check network or raspiot-server.")
     }
@@ -773,10 +1133,10 @@ async function getDeviceList(filters) {
     }
     url += param ? "?" + param.substring(1) : ""
 
-    let req = new Request(url)
+    let req = newRequest(url)
     req.timeoutInterval = 5
     try {
-        return await req.loadJSON()
+        return await fetchReq(req, true)
     } catch (error) {
         log(`Get device list failed: ${error}`)
         return null
@@ -784,11 +1144,14 @@ async function getDeviceList(filters) {
 }
 
 async function getDeviceAttrs(deviceUuid, realtime) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/device/${deviceUuid}?realtime=${realtime}`)
-    let req = new Request(url)
+    url = encodeURI(realtime
+        ? `${CONF.raspiotEndpoint}/devices/${deviceUuid}/attrs:refresh`
+        : `${CONF.raspiotEndpoint}/devices/${deviceUuid}`)
+    let req = newRequest(url)
+    if (realtime) req.method = "POST"
     req.timeoutInterval = 5
     try {
-        return await req.loadJSON()
+        return await fetchReq(req, true)
     } catch (error) {
         notification("Get device attrs failed", error + "pls check network or raspiot-server.")
     }
@@ -925,17 +1288,14 @@ async function setAttr(table, room, device, attrName, attrValue) {
         return
     }
 
-    url = encodeURI(`${CONF.raspiotEndpoint}/device/${device.uuid}/attr`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/devices/${device.uuid}/attrs/${attrName}`)
+    let req = newRequest(url)
     req.method = "PUT"
     req.timeoutInterval = 10
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
-    req.addParameterToMultipart("attr", attrName)
     req.addParameterToMultipart("value", attrValue)
 
     try {
-        await req.loadJSON()
+        await fetchReq(req, true)
     } catch (error) {
         notification("Set device attr failed", error)
     }
@@ -943,11 +1303,11 @@ async function setAttr(table, room, device, attrName, attrValue) {
 }
 
 function imgUri(value) {
-    onUri = `${CONF.raspiotEndpoint}/statics/switch_on.png`
-    offUri = `${CONF.raspiotEndpoint}/statics/switch_off.png`
-    iconUri = `${CONF.raspiotEndpoint}/statics/raspiot.png`
-    buttonUri = `${CONF.raspiotEndpoint}/statics/button.png`
-    loadingUri = `${CONF.raspiotEndpoint}/statics/loading.png`
+    onUri = `${CONF.raspiotEndpoint}/static/switch_on.png`
+    offUri = `${CONF.raspiotEndpoint}/static/switch_off.png`
+    iconUri = `${CONF.raspiotEndpoint}/static/raspiot.png`
+    buttonUri = `${CONF.raspiotEndpoint}/static/button.png`
+    loadingUri = `${CONF.raspiotEndpoint}/static/loading.png`
 
     uriMapping = {
         on: onUri,
@@ -1022,12 +1382,10 @@ async function scanDeviceInfo() {
 }
 
 async function addDeviceReq(room, device) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/device`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/devices`)
+    let req = newRequest(url)
     req.method = "POST"
     req.timeoutInterval = 10
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
     req.addParameterToMultipart("name", device.name)
     if (device.mac_addr)
         req.addParameterToMultipart("mac_addr", device.mac_addr)
@@ -1047,7 +1405,7 @@ async function addDeviceReq(room, device) {
         req.addParameterToMultipart("token", device.token)
     req.addParameterToMultipart("room", room)
     try {
-        response = await req.loadJSON()
+        response = await fetchReq(req, true)
         if ((response.code || 200) !== 200) {
             notification(`Add device ${device.name} failed`, response.message)
         }
@@ -1107,12 +1465,10 @@ async function updateDevice(roomTable, room, device) {
 }
 
 async function updateDeviceReq(device) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/device/${device.uuid}`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/devices/${device.uuid}`)
+    let req = newRequest(url)
     req.method = "PUT"
     req.timeoutInterval = 5
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
     if (device.new_name)
         req.addParameterToMultipart("name", device.new_name)
     if (device.mac_addr)
@@ -1133,7 +1489,7 @@ async function updateDeviceReq(device) {
         req.addParameterToMultipart("token", device.token)
 
     try {
-        response = await req.load()
+        response = await fetchReq(req, false)
         if ((response.code || 200) !== 200) {
             notification("Update device " + device.name + " failed", response.message)
         }
@@ -1181,15 +1537,13 @@ async function delDeviceConfirm(roomTable, room, device) {
 }
 
 async function delDeviceReq(device) {
-    url = encodeURI(`${CONF.raspiotEndpoint}/device/${device.uuid}`)
-    let req = new Request(url)
+    url = encodeURI(`${CONF.raspiotEndpoint}/devices/${device.uuid}`)
+    let req = newRequest(url)
     req.method = "DELETE"
     req.timeoutInterval = 5
-    req.headers = {"Content-Type": "application/json"}
-    req.allowInsecureRequest = true
 
     try {
-        await req.load()
+        await fetchReq(req, false)
     } catch (error) {
         notification("Remove device failed", "pls check network or raspiot-server.")
     }
